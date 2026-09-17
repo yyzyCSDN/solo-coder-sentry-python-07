@@ -106,7 +106,7 @@ jobs:
           coverage xml
       - name: Parse and Upload Coverage
         if: ${{ !cancelled() }}
-        uses: getsentry/codecov-action@d90e69cdf071dfbb0430159125321dc09c424d4c # main
+        uses: getsentry/codecov-action@ddb065d5105e242ac3ef22826e270b0d61fc8919 # main
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           files: coverage.xml
