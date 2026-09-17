@@ -1,3 +1,5 @@
+import asyncio
+import threading
 import uuid
 from unittest import mock
 
@@ -482,3 +484,215 @@ async def test_contextmanager_error_async(sentry_init):
         assert fake_capture_checkin.call_args[1]["status"] == "error"
         assert fake_capture_checkin.call_args[1]["duration"]
         assert fake_capture_checkin.call_args[1]["check_in_id"]
+
+
+def _recording_fake(recorded):
+    """
+    A fake `capture_checkin` that records (status, check_in_id) pairs and
+    hands out a fresh check-in id for every opening check-in, like the real
+    implementation does.
+    """
+
+    def fake(**kwargs):
+        check_in_id = kwargs.get("check_in_id") or uuid.uuid4().hex
+        recorded.append((kwargs["status"], check_in_id))
+        return check_in_id
+
+    return fake
+
+
+def test_concurrent_replicas_do_not_clobber_checkin_ids(sentry_init):
+    sentry_init()
+
+    both_inside = threading.Barrier(2, timeout=5)
+
+    @sentry_sdk.monitor(monitor_slug="replicated-task")
+    def task():
+        # Make sure both runs are inside the task (and thus have an open
+        # check-in) before either of them finishes.
+        both_inside.wait()
+
+    recorded = []
+    with mock.patch(
+        "sentry_sdk.crons.decorator.capture_checkin",
+        side_effect=_recording_fake(recorded),
+    ):
+        threads = [threading.Thread(target=task) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
+            assert not thread.is_alive()
+
+    opened = {
+        check_in_id for status, check_in_id in recorded if status == "in_progress"
+    }
+    closed = {
+        check_in_id for status, check_in_id in recorded if status != "in_progress"
+    }
+
+    assert len(opened) == 2
+    # Each run must close its own check-in, not the other run's.
+    assert closed == opened
+
+
+@pytest.mark.asyncio
+async def test_concurrent_async_replicas_do_not_clobber_checkin_ids(sentry_init):
+    sentry_init()
+
+    entered = 0
+    both_entered = asyncio.Event()
+
+    @sentry_sdk.monitor(monitor_slug="async-replicated-task")
+    async def task():
+        nonlocal entered
+        entered += 1
+        if entered == 2:
+            both_entered.set()
+        # Make sure both runs have an open check-in before either finishes.
+        await both_entered.wait()
+
+    recorded = []
+    with mock.patch(
+        "sentry_sdk.crons.decorator.capture_checkin",
+        side_effect=_recording_fake(recorded),
+    ):
+        await asyncio.gather(task(), task())
+
+    opened = {
+        check_in_id for status, check_in_id in recorded if status == "in_progress"
+    }
+    closed = {
+        check_in_id for status, check_in_id in recorded if status != "in_progress"
+    }
+
+    assert len(opened) == 2
+    # Each run must close its own check-in, not the other run's.
+    assert closed == opened
+
+
+def test_sequential_runs_get_distinct_checkin_ids(sentry_init, capture_envelopes):
+    sentry_init()
+    envelopes = capture_envelopes()
+
+    _hello_world("Grace")
+    _hello_world("Grace")
+
+    check_in_ids = [
+        envelope.items[0].payload.json["check_in_id"] for envelope in envelopes
+    ]
+
+    # Each run's opening and closing check-ins share one id, and the two
+    # runs must not reuse each other's id.
+    assert check_in_ids[0] == check_in_ids[1]
+    assert check_in_ids[2] == check_in_ids[3]
+    assert check_in_ids[0] != check_in_ids[2]
+
+
+def test_broken_reporting_does_not_break_task(sentry_init):
+    sentry_init()
+
+    with mock.patch(
+        "sentry_sdk.crons.decorator.capture_checkin",
+        side_effect=RuntimeError("reporting is broken"),
+    ):
+        assert _hello_world("Grace") == "Hello, Grace"
+
+
+def test_broken_reporting_does_not_mask_task_exception(sentry_init):
+    sentry_init()
+
+    with mock.patch(
+        "sentry_sdk.crons.decorator.capture_checkin",
+        side_effect=RuntimeError("reporting is broken"),
+    ):
+        with pytest.raises(ZeroDivisionError):
+            _break_world("Grace")
+
+
+def test_max_runtime_is_reported_in_monitor_config(sentry_init, capture_envelopes):
+    sentry_init()
+    envelopes = capture_envelopes()
+
+    config = {"schedule": {"type": "crontab", "value": "0 0 * * *"}}
+
+    @sentry_sdk.monitor(monitor_slug="nightly", monitor_config=config, max_runtime=30)
+    def nightly():
+        return 42
+
+    assert nightly() == 42
+
+    # The caller's config dict must not be mutated.
+    assert config == {"schedule": {"type": "crontab", "value": "0 0 * * *"}}
+
+    # Both the opening and the closing check-in carry the max_runtime, so a
+    # run that never reports back is marked as timed out (not just failed)
+    # in Sentry.
+    assert len(envelopes) == 2
+    for envelope in envelopes:
+        check_in = envelope.items[0].payload.json
+        assert check_in["monitor_config"]["max_runtime"] == 30
+        assert check_in["monitor_config"]["schedule"] == {
+            "type": "crontab",
+            "value": "0 0 * * *",
+        }
+
+
+def test_run_exceeding_max_runtime_still_reports(sentry_init, capture_envelopes):
+    sentry_init()
+    envelopes = capture_envelopes()
+
+    @sentry_sdk.monitor(monitor_slug="slow-task", max_runtime=0)
+    def slow_task():
+        return "done"
+
+    assert slow_task() == "done"
+
+    opening, closing = (envelope.items[0].payload.json for envelope in envelopes)
+    assert opening["status"] == "in_progress"
+    assert opening["monitor_config"]["max_runtime"] == 0
+    assert closing["status"] == "ok"
+    assert closing["duration"] is not None
+
+
+def test_context_manager_exposes_check_in_id(sentry_init, capture_envelopes):
+    sentry_init()
+    envelopes = capture_envelopes()
+
+    with sentry_sdk.monitor(monitor_slug="abc123") as m:
+        pass
+
+    opening, closing = (envelope.items[0].payload.json for envelope in envelopes)
+    assert m.check_in_id == opening["check_in_id"]
+    assert closing["check_in_id"] == m.check_in_id
+
+
+def test_failed_checkin_is_trace_linked_to_the_error(sentry_init, capture_envelopes):
+    sentry_init()
+    envelopes = capture_envelopes()
+
+    try:
+        _break_world("Grace")
+    except ZeroDivisionError as exc:
+        sentry_sdk.capture_exception(exc)
+
+    check_ins = []
+    error_events = []
+    for envelope in envelopes:
+        payload = envelope.items[0].payload.json
+        if payload.get("type") == "check_in":
+            check_ins.append(payload)
+        else:
+            error_events.append(payload)
+
+    assert [check_in["status"] for check_in in check_ins] == ["in_progress", "error"]
+    assert len(error_events) == 1
+
+    # The failed check-in and the exception that caused it share a trace, so
+    # the reason the run was judged as failed can be looked up in Sentry.
+    failed_check_in = check_ins[1]
+    assert failed_check_in["contexts"]["trace"]["trace_id"]
+    assert (
+        failed_check_in["contexts"]["trace"]["trace_id"]
+        == error_events[0]["contexts"]["trace"]["trace_id"]
+    )
