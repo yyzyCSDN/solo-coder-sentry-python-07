@@ -43,6 +43,8 @@ def capture_checkin(
     duration: "Optional[float]" = None,
     monitor_config: "Optional[MonitorConfig]" = None,
 ) -> str:
+    check_in_id = check_in_id or uuid.uuid4().hex
+
     check_in_event = _create_check_in_event(
         monitor_slug=monitor_slug,
         check_in_id=check_in_id,
@@ -51,10 +53,19 @@ def capture_checkin(
         monitor_config=monitor_config,
     )
 
-    sentry_sdk.capture_event(check_in_event)
+    # Reporting must never raise into the job being monitored. The check-in id
+    # is still returned so callers can close the run with a terminal check-in.
+    try:
+        sentry_sdk.capture_event(check_in_event)
+    except Exception:
+        logger.exception(
+            "[Crons] Failed to capture check-in (%s) for monitor %s",
+            check_in_id,
+            monitor_slug,
+        )
 
     logger.debug(
         f"[Crons] Captured check-in ({check_in_event.get('check_in_id')}): {check_in_event.get('monitor_slug')} -> {check_in_event.get('status')}"
     )
 
-    return check_in_event["check_in_id"]
+    return check_in_id
