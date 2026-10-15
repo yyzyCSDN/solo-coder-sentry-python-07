@@ -58,7 +58,7 @@ jobs:
           # This will also trigger "make dist" that creates the Python packages
           make aws-lambda-layer
       - name: Upload Python Packages
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: artifact-build_lambda_layer
           path: |
@@ -80,7 +80,7 @@ jobs:
           make apidocs
           cd docs/_build && zip -r gh-pages ./
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: artifact-docs
           path: |
